@@ -101,12 +101,12 @@ Remember to add tags to all node VMs: `qvm-tag [VM] add snitch`
 
 ### UI (server) Setup (qubes-opensnitch-piped)
 ```bash
-./qubes-opensnitch-piped -c /path/to/config.json -a 127.0.0.1 -p 50051 -l 127.0.0.1 -lp 50050 -ad
+./qubes-opensnitch-piped -ad
 ```
 
 ### Node (client) Setup (qubes-opensnitch-pipe)
 ```bash
-./qubes-opensnitch-pipe -c /etc/opensnitchd/default-config.json -t 127.0.0.1 -p 50050 -s /path/to/rules/src -sp .host-vm -d /etc/opensnitchd/rules
+./qubes-opensnitch-pipe
 ```
 
 ## Configuration Example
