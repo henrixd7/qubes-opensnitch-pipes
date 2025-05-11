@@ -1,0 +1,179 @@
+#!/usr/bin/python3
+
+import argparse
+import socket
+import subprocess
+import psutil
+import errno
+import os
+import re
+import sys
+import logging
+from ipaddress import ip_address
+from time import sleep
+
+def connect():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    logging.info(f"connecting to {args.connect} to port {args.port}")
+    s.connect((str(args.connect), args.port))
+    return s
+
+def init_pipe(s):
+    s.send(hostname.encode())
+    response = s.recv(1024).decode()
+    try:
+    	port = int(response)
+    except ValueError:
+    	logging.error(response)
+    	sys.exit(1)
+    return port
+
+def open_tcp_pipe(port):
+	for p in psutil.process_iter():
+		if p.name() == "socat" and p.cmdline()[1] == f"TCP-LISTEN:{port},reuseaddr,fork":
+			logging.info(f"socat pipe to {port} already open")
+			return
+	#subprocess.Popen(['sudo', 'qvm-connect-tcp', f'::{port}'], preexec_fn=os.setpgrp)
+	subprocess.run(['qvm-connect-tcp', f'::{port}'])
+
+def edit_opensnitch_config(port):
+	logging.info(f"injecting {port} to {args.config}")
+	subprocess.run([
+		'sudo', 'sed', '-i.bk',
+		f"s/\"Address\"\\s*:\\s*\".*\"/\"Address\":\"localhost:{port}\"/",
+		args.config
+	])
+
+def copy_rules(rules_src, rules_dst):
+	if rules_src and rules_dst:
+		logging.info(f"copying all rules from {rules_src} to {rules_dst}")
+		path_src = os.path.join(rules_src, "*")
+		subprocess.run([
+			f"sudo cp {path_src} {rules_dst}"
+		], shell=True)
+
+def start_opensnitch():
+	for p in psutil.process_iter():
+		if p.name() == "opensnitchd":
+			logging.warning("opensnitchd already running")
+			return
+	logging.info("starting opensnitch")
+	subprocess.run(['sudo', 'systemctl', 'enable', '--now', 'opensnitch'])
+
+def is_disposable(host):
+	return re.match(r"^disp[0-9]+$", host)
+
+def rules_dir_prefix(path):
+	if is_disposable(hostname):
+		path = f"{path}.disp"
+	else:
+		path = f"{path}.{hostname}"
+	if os.path.isdir(path):
+		return path
+	else:
+		raise FileNotFoundError(
+			errno.ENOENT, os.strerror(errno.ENOENT), path)
+
+def dir_path(path):
+	if os.path.isdir(path):
+		return path
+	else:
+		raise FileNotFoundError(
+			errno.ENOENT, os.strerror(errno.ENOENT), path)
+
+def file_path(path):
+	if os.path.isfile(path):
+		return path
+	else:
+		raise FileNotFoundError(
+			errno.ENOENT, os.strerror(errno.ENOENT), path)
+
+def translate_logging_level(level):
+	if level == "info":
+		return logging.INFO
+	elif level == "warn":
+		return logging.WARNING
+	elif level == "error":
+		return logging.ERROR
+	elif level == "critical":
+		return logging.CRITICAL
+	else:
+		return None
+
+if __name__ == "__main__":
+	descr = "Client to help nodes to identify with qubes.ConnectTCP on OpenSnitch"
+	parser = argparse.ArgumentParser(description=descr)
+	parser.add_argument(
+		'-c', '--config',
+		type=file_path,
+		default='/etc/opensnitchd/default-config.json',
+		help="OpenSnitch configuration file (where recieved port number will be injected)"
+	)
+	parser.add_argument(
+		'-t', '--connect',
+		type=ip_address,
+		default='127.0.0.1',
+		help="IP address for server connection"
+	)
+	parser.add_argument(
+		'-p', '--port',
+		type=int,
+		default=50050,
+		help="port for server connection"
+	)
+	parser.add_argument(
+		'-s', '--rules-src',
+		type=dir_path,
+		help="rules directory (all rules are copied to --rules-dest)"
+	)
+	parser.add_argument(
+		'-sp', '--rules-prefix',
+		type=rules_dir_prefix,
+		help="rules directory prefix (\".$hostname\" will be added to this path)"
+	)
+	parser.add_argument(
+		'-d', '--rules-dest',
+		type=dir_path,
+		default="/etc/opensnitchd/rules",
+		help="define OpenSnitch rules directory (default: /etc/opensnitchd/rules)"
+	)
+	parser.add_argument(
+		'-ll', '--log-level',
+		choices=["info", "warn", "error", "critical"],
+		default="error",
+		help="Sets output level to..."
+	)
+
+	hostname = socket.gethostname()
+	args = parser.parse_args()
+
+	logging.basicConfig(level=translate_logging_level(args.log_level))
+
+	# Open control connection to get port number with socat
+	# we need to give little time for this to happen
+	open_tcp_pipe(args.port)
+	sleep(0.2)
+
+	# Request which port we should be using
+	logging.info(f"Connecting to hostname")
+	client_socket = connect()
+	port = init_pipe(client_socket)
+	logging.info(f"Recieved port {port}")
+	client_socket.close()
+
+	# Open connection to the given port with socat
+	open_tcp_pipe(port)
+
+	# Inject given port number to OpenSnitch configuration file
+	# and replace anything defined in Server / Addres attribute
+	# ...original file is backed up with ".bk" postfix.
+	edit_opensnitch_config(port)
+
+	# Copy OpenSnitch rules as defined by the user
+	if args.rules_src:
+		copy_rules(args.rules_src, args.rules_dest)
+	if args.rules_prefix:
+		copy_rules(args.rules_prefix, args.rules_dest)
+
+	# Everything should be configured now...starting opensnitchd
+	start_opensnitch()
