@@ -89,8 +89,25 @@ nano ~/.config/qubes-opensnitch-piped/config.json
 ```
 
 ### Enable the Helper Service
-Enable the user-level systemd service for the pipe daemon:
 
+Create the user-level systemd service file:
+File: `~/.config/systemd/user/qubes-opensnitch-piped.service`
+
+```ini
+[Unit]
+Description=Qubes OpenSnitch Piped Connector
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/qubes-opensnitch-piped -ad \
+    -c /home/user/.config/qubes-opensnitch-piped/config.json
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Enable the user-level systemd service for the pipe daemon:
 ```bash
 systemctl --user enable --now qubes-opensnitch-piped
 ```
@@ -237,3 +254,4 @@ options:
   -lp, --listen-port    Listen port for service (default: 50050)
   -ad, --allow-disposables  Allow disposables without address defined in config
 ```
+
