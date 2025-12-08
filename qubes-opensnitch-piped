@@ -1,92 +1,200 @@
 #!/usr/bin/python3
 
 import argparse
+import socketserver
+#import asyncio
 import socket
+import signal
+import logging
 import subprocess
-import psutil
-import errno
+#import threading
+import json
+import sys
 import os
 import re
-import sys
-import logging
+#from functools import partial
+#from threading import Thread
 from ipaddress import ip_address
-from time import sleep
+#from types import FrameType
+#from typing import Callable
 
-def connect():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    logging.info(f"connecting to {args.connect} to port {args.port}")
-    s.connect((str(args.connect), args.port))
-    return s
+class SocketServer(socketserver.ThreadingTCPServer):
+	reuse_addresses = True
+	daemon_threads = True
+	block_on_close = False
+	open_pipes = {}
+	next_dev_id = -1
+	conf_file = None
+	conf = None
+	cur_port = 50051
+	cur_incr_ip = ip_address("127.0.0.1")
+	allow_disposables = False
 
-def init_pipe(s):
-    s.send(hostname.encode())
-    response = s.recv(1024).decode()
-    try:
-    	port = int(response)
-    except ValueError:
-    	logging.error(response)
-    	sys.exit(1)
-    return port
+	def __init__(self, listen, handler, args):
+		if args.config:
+			self.conf_file = args.config
+			self.load_conf()
 
-def open_tcp_pipe(port):
-	for p in psutil.process_iter():
-		if p.name() == "socat" and p.cmdline()[1] == f"TCP-LISTEN:{port},reuseaddr,fork":
-			logging.info(f"socat pipe to {port} already open")
+		if args.address:
+			self.cur_incr_ip = args.address
+			print(f"ip address: {args.address}")
+
+		if args.port:
+			self.cur_port = args.port
+
+		if args.allow_disposables:
+			self.allow_disposables = True
+
+		super().__init__(listen, handler)
+
+	def load_conf(self):
+		with open(self.conf_file) as conf_json:
+			self.conf = json.load(conf_json)
+
+	def next_ip(self):
+		i = 1
+		if self.conf:
+			# skip addresses already defined in config
+			while self.is_ip_in_conf(self.cur_incr_ip + i):
+				i += 1
+		self.cur_incr_ip += i
+		return self.cur_incr_ip
+
+	def is_ip_in_conf(self, ip):
+		return str(ip) in self.conf.values()
+
+	def next_dev(self):
+		self.next_dev_id += 1
+		return f"snitch{self.next_dev_id}"
+
+	def next_port(self):
+		self.cur_port += 1
+		return self.cur_port
+
+	def clean_exit(self, sig, frame):
+		if sig == signal.SIGHUP:
+			self.load_conf()
+		if sig == signal.SIGINT or sig == signal.SIGTERM or sig == signal.SIGQUIT:
+			for hostname, pipe in self.open_pipes.items():
+				subprocess.run(['sudo', 'ip', 'link', 'del', 'dev', pipe["dev"]])
+			self.server_close()
+			sys.exit(0)
+
+	def save_pipe_info(self, hostname, config):
+		self.open_pipes[hostname] = config
+
+class ServerHandler(socketserver.BaseRequestHandler):
+	server: SocketServer
+
+	def handle(self):
+		# Receive "should be hostname" from client
+		data = self.request.recv(1024).decode()
+		if not data:
 			return
-	#subprocess.Popen(['sudo', 'qvm-connect-tcp', f'::{port}'], preexec_fn=os.setpgrp)
-	subprocess.run(['qvm-connect-tcp', f'::{port}'])
+		hostname = data.strip()
 
-def edit_opensnitch_config(port):
-	logging.info(f"injecting {port} to {args.config}")
-	subprocess.run([
-		'sudo', 'sed', '-i.bk',
-		f"s/\"Address\"\\s*:\\s*\".*\"/\"Address\":\"localhost:{port}\"/",
-		args.config
-	])
-
-def copy_rules(rules_src, rules_dst):
-	if rules_src and rules_dst:
-		logging.info(f"copying all rules from {rules_src} to {rules_dst}")
-		path_src = os.path.join(rules_src, "*")
-		subprocess.run([
-			f"sudo cp {path_src} {rules_dst}"
-		], shell=True)
-
-def start_opensnitch():
-	for p in psutil.process_iter():
-		if p.name() == "opensnitchd":
-			logging.warning("opensnitchd already running")
+		# Make sure that "should be hostname" even remotelly resembles
+		# hostname.
+		#
+		# We're only using this value to get predefined values from config
+		# file and allowing clients to re-connect to a previously opened pipe.
+		if not self.is_valid_hostname(hostname):
+			self.error("Bad hostname")
 			return
-	logging.info("starting opensnitch")
-	subprocess.run(['sudo', 'systemctl', 'enable', '--now', 'opensnitch'])
+		else:
+			logging.info(f"Connection from {hostname}")
 
-def is_disposable(host):
-	return re.match(r"^disp[0-9]+$", host)
+		# Check for already opened pipes for this host
+		if hostname in self.server.open_pipes:
+			pipe = self.server.open_pipes.get(hostname)
+			self.request.send(str(pipe['port']).encode())
+			return
 
-def rules_dir_prefix(path):
-	if is_disposable(hostname):
-		path = f"{path}.disp"
-	else:
-		path = f"{path}.{hostname}"
-	if os.path.isdir(path):
-		return path
-	else:
-		raise FileNotFoundError(
-			errno.ENOENT, os.strerror(errno.ENOENT), path)
+		# Config file not defined ...using next free IP for all VMs
+		if self.server.conf is None:
+			ip_address = self.server.next_ip()
 
-def dir_path(path):
-	if os.path.isdir(path):
-		return path
-	else:
-		raise FileNotFoundError(
-			errno.ENOENT, os.strerror(errno.ENOENT), path)
+		# Limiting allowed connections to those defined in config file
+		else:
+			if self.is_disposable(hostname):
+				# Disposables can be configured with using "disp" name
+				use_host = "disp"
+			else:
+				use_host = hostname
 
-def file_path(path):
-	if os.path.isfile(path):
-		return path
-	else:
-		raise FileNotFoundError(
-			errno.ENOENT, os.strerror(errno.ENOENT), path)
+			# Filter out hosts not defined in config
+			if use_host not in self.server.conf:
+				# Allow disposables when (-ad) --allow-disposables is used
+				if use_host == "disp" and self.server.allow_disposables:
+					ip_address = self.server.next_ip()
+				else:
+					self.error("Hostname not recognized")
+					return
+			else:
+				# VM gets to only use address defined in config
+				ip_address = self.server.conf[use_host]
+
+		dev = self.server.next_dev()
+		port = self.server.next_port()
+		logging.info(f"creating device {dev} with address {ip_address}")
+		self.create_dummy_interface(dev, ip_address)
+
+		# Open socat pipe for node
+		logging.info(f"starting socat pipe to {port} for {ip_address}")
+		p = subprocess.Popen([
+			"/usr/bin/socat",
+			f"TCP4-LISTEN:{port},reuseaddr,fork",
+			f"TCP4-CONNECT:{ip_address}:50051"
+		])
+
+		# Store opened pipe so clients can reconnect to same pipes if necessary
+		self.server.save_pipe_info(hostname, {
+			"port": port,
+			"ip_address": ip_address,
+			"dev": dev
+		})
+
+		# We're done, send port to the client.
+		logging.info(f"sending port:{port} to client")
+		self.request.send(str(port).encode())
+
+	def error(self, msg):
+		logging.error(msg)
+		self.request.send(msg.encode())
+
+	# Validate hostname
+	#
+    # - doesn't begin or end with a hyphen
+    # - limit the length of the total hostname to 253 characters
+    # 					(after stripping the optional trailing dot)
+    # - limit each segment to maximum of 63 characters
+    # - limit the character set to ASCII (i.e. use [0-9] instead of \d)
+    #
+    # https://stackoverflow.com/a/2532344
+    # https://stackoverflow.com/a/33214423
+	def is_valid_hostname(self, hostname):
+		if hostname[-1] == ".":
+			# strip exactly one dot from the right, if present
+			hostname = hostname[:-1]
+		if len(hostname) > 253:
+			return False
+
+		labels = hostname.split(".")
+
+		# the TLD must be not all-numeric
+		if re.match(r"[0-9]+$", labels[-1]):
+			return False
+
+		allowed = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)$", re.IGNORECASE)
+		return all(allowed.match(label) for label in labels)
+	
+	def is_disposable(self, host):
+		return re.match(r"^disp[0-9]+$", host)
+
+	def create_dummy_interface(self, dev, ip):
+		subprocess.run(['sudo', 'ip', 'link', 'add', dev, 'type', 'dummy'])
+		subprocess.run(['sudo', 'ip', 'addr', 'add', f"{ip}/8", 'dev', dev])
+		subprocess.run(['sudo', 'ip', 'link', 'set', 'up', 'dev', dev])
 
 def translate_logging_level(level):
 	if level == "info":
@@ -100,42 +208,51 @@ def translate_logging_level(level):
 	else:
 		return None
 
+def file_path(path):
+	if os.path.isfile(path):
+		return path
+	else:
+		raise FileNotFoundError(
+			errno.ENOENT, os.strerror(errno.ENOENT), filename)
+
 if __name__ == "__main__":
-	descr = "Client to help nodes to identify with qubes.ConnectTCP on OpenSnitch"
+	descr = "Help OpenSnitch nodes with qubes.ConnectTCP to identify on UI"
 	parser = argparse.ArgumentParser(description=descr)
 	parser.add_argument(
 		'-c', '--config',
 		type=file_path,
-		default='/etc/opensnitchd/default-config.json',
-		help="OpenSnitch configuration file (where recieved port number will be injected)"
+		help="json file path for acceptable { \"host\":\"ip_address\", \"host2\":\"ip_address2\" ... } pairs"
 	)
 	parser.add_argument(
-		'-t', '--connect',
+		'-a', '--address',
 		type=ip_address,
-		default='127.0.0.1',
-		help="IP address for server connection"
+		help="""starting ip address/range (default: 127.0.0.1), this will be
+				incremented, so first address given to client would be
+				127.0.0.2"""
 	)
 	parser.add_argument(
 		'-p', '--port',
 		type=int,
+		default=50051,
+		help="""starting port for node connections (default: 50051),
+				this value is incremented for each new connection"""
+	)
+	parser.add_argument(
+		'-l', '--listen',
+		type=ip_address,
+		default=ip_address("127.0.0.1"),
+		help="listen address for service (default: 127.0.0.1)"
+	)
+	parser.add_argument(
+		'-lp', '--listen-port',
+		type=int,
 		default=50050,
-		help="port for server connection"
+		help="listen port for service (default: 50050)"
 	)
 	parser.add_argument(
-		'-s', '--rules-src',
-		type=dir_path,
-		help="rules directory (all rules are copied to --rules-dest)"
-	)
-	parser.add_argument(
-		'-sp', '--rules-prefix',
-		type=rules_dir_prefix,
-		help="rules directory prefix (\".$hostname\" will be added to this path)"
-	)
-	parser.add_argument(
-		'-d', '--rules-dest',
-		type=dir_path,
-		default="/etc/opensnitchd/rules",
-		help="define OpenSnitch rules directory (default: /etc/opensnitchd/rules)"
+		'-ad', '--allow-disposables',
+		action="store_true",
+		help="allow all disposables without address defined in config"
 	)
 	parser.add_argument(
 		'-ll', '--log-level',
@@ -143,37 +260,16 @@ if __name__ == "__main__":
 		default="error",
 		help="Sets output level to..."
 	)
-
-	hostname = socket.gethostname()
 	args = parser.parse_args()
 
 	logging.basicConfig(level=translate_logging_level(args.log_level))
 
-	# Open control connection to get port number with socat
-	# we need to give little time for this to happen
-	open_tcp_pipe(args.port)
-	sleep(0.2)
+	with SocketServer((str(args.listen), args.listen_port), ServerHandler, args) as server:
+		for sig in (
+			signal.SIGHUP,
+			signal.SIGINT,
+			signal.SIGTERM,
+			signal.SIGQUIT):
+			signal.signal(sig, server.clean_exit)
 
-	# Request which port we should be using
-	logging.info(f"Connecting to hostname")
-	client_socket = connect()
-	port = init_pipe(client_socket)
-	logging.info(f"Recieved port {port}")
-	client_socket.close()
-
-	# Open connection to the given port with socat
-	open_tcp_pipe(port)
-
-	# Inject given port number to OpenSnitch configuration file
-	# and replace anything defined in Server / Addres attribute
-	# ...original file is backed up with ".bk" postfix.
-	edit_opensnitch_config(port)
-
-	# Copy OpenSnitch rules as defined by the user
-	if args.rules_src:
-		copy_rules(args.rules_src, args.rules_dest)
-	if args.rules_prefix:
-		copy_rules(args.rules_prefix, args.rules_dest)
-
-	# Everything should be configured now...starting opensnitchd
-	start_opensnitch()
+		server.serve_forever()
