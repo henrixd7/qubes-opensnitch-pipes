@@ -29,6 +29,7 @@ This system consists of two components:
 * **Qubes OS**
 * **OpenSnitch** installed on the TemplateVM used by your nodes and the UI VM.
 
+Remember to disable opensnitch systemd service `systemctl disable opensnitch` and remove `/etc/xdg/autostart/opensnitch_ui.desktop`. We will handle these steps differently later.
 ---
 
 ## 1. Qubes Policy Configuration (dom0)
